@@ -6,6 +6,17 @@ import io
 st.set_page_config(page_title="Paddle Parser Pro", layout="wide")
 st.title("📊 Paddle Analytics: Парсер транзакций")
 
+# --- КОНФИГУРАЦИЯ: Price ID для новых продуктов ---
+# AB тест: недельный триал $4.99 → месячная подписка $29.99
+AB_TEST_OTP_PRICE = 'pri_01kh1355651wfrxjef8bqjf6c7'
+AB_TEST_SUB_PRICE = 'pri_01kh1fdhza697vde9285837ccr'
+
+# Апселлы (разовые покупки)
+UPSELL_PAIN_SHIELD_PRICE = 'pri_01khnrc611h5wdg986vkxrv3ga'    # $14.99 Pain Shield
+UPSELL_BELLY_BURNER_PRICE = 'pri_01khnrvmxd0srxcbmgq05b0gb5'   # $14.99 Belly Burner System
+UPSELL_BUNDLE_PRICE = 'pri_01khnrb54wqk49x7jy92gcw88r'          # $19.99 бандл (оба вместе)
+
+
 # --- ГЛАВНАЯ ЛОГИКА (Бизнес-правила) ---
 def process_paddle_file(file_obj):
     # 1. Загрузка
@@ -18,23 +29,36 @@ def process_paddle_file(file_obj):
             df[col] = pd.to_datetime(df[col], errors='coerce')
 
     # 3. Оставляем только успешные оплаты
-    # (Выкидываем мусор типа draft/ready/canceled)
     df = df[df['status'] == 'completed'].copy()
     
-    # 4. Считаем длительность подписки (Double Check по периоду)
-    # Если дат нет (это OTP), результат будет NaT/NaN
+    # 4. Считаем длительность подписки
     df['duration_days'] = (df['billing_period_ends_at'] - df['billing_period_starts_at']).dt.days
 
     # 5. Функция категоризации каждой строки
     def categorize(row):
-        price_usd = row['balance_currency_total'] # Сумма, которая пришла нам (уже в USD)
+        price_usd = row['balance_currency_total']
         days = row['duration_days']
         sub_id = row.get('subscription_id')
+        price_ids = str(row.get('price_id_list', ''))
 
-        # --- ЛОГИКА OTP (Разовые) ---
-        # Признак: нет ID подписки ИЛИ длительность не определена (0 или NaN)
+        # --- AB ТЕСТ: триал $4.99 (неделя) → $29.99 (месяц) ---
+        # Триал: в price_id_list два ID (OTP + подписка), период 7 дней
+        if AB_TEST_OTP_PRICE in price_ids and AB_TEST_SUB_PRICE in price_ids:
+            return 'Trial Week (AB)'
+        # Конверсия: только подписочный price_id, 28-дневный период
+        if price_ids == AB_TEST_SUB_PRICE:
+            return 'Month $29.99 (AB)'
+
+        # --- АПСЕЛЛЫ (разовые покупки по price_id) ---
+        if UPSELL_PAIN_SHIELD_PRICE in price_ids:
+            return 'Upsell Pain Shield ($14.99)'
+        if UPSELL_BELLY_BURNER_PRICE in price_ids:
+            return 'Upsell Belly Burner ($14.99)'
+        if UPSELL_BUNDLE_PRICE in price_ids:
+            return 'Upsell Bundle ($19.99)'
+
+        # --- ЛОГИКА OTP (Разовые, не попавшие в апселлы) ---
         if pd.isna(sub_id) or pd.isna(days) or days == 0:
-            # Разделяем OTP по цене (с запасом на курсовые разницы)
             if 10.0 <= price_usd < 20.0:
                 return 'OTP Small ($14.99)'
             elif 20.0 <= price_usd < 35.0:
@@ -43,8 +67,6 @@ def process_paddle_file(file_obj):
                 return 'OTP Other'
 
         # --- ЛОГИКА ПОДПИСОК ---
-        
-        # Шаг А: Определяем Период по дням (календарь не врет)
         period_name = 'Unknown'
         if 1 <= days <= 10:
             period_name = 'Week'
@@ -55,20 +77,18 @@ def process_paddle_file(file_obj):
         else:
             return 'Other Sub'
 
-        # Шаг Б: Определяем Триал по цене (Full Week/Month не нужны)
         if period_name == 'Week':
-            if price_usd < 7.5:  # Триал ~$4.99
+            if price_usd < 7.5:
                 return 'Trial Week'
             
         elif period_name == 'Month':
-            if price_usd < 22.0:  # Триал ~$14.99 или $19.99
+            if price_usd < 22.0:
                 return 'Trial Month'
             
         elif period_name == '3 Months':
-            if price_usd < 45.0:  # Триал ~$29.99
+            if price_usd < 45.0:
                 return 'Trial 3 Months'
 
-        # Full Week/Month/3 Months -> Other Sub
         return 'Other Sub'
 
     # Применяем функцию ко всем строкам
@@ -107,8 +127,11 @@ if uploaded_file:
             
         with col2:
             st.subheader("2. Типы транзакций")
-            # Сортируем категории: сначала Trial Week/Month/3 Months, потом остальные
-            preferred_order = ['Trial Week', 'Trial Month', 'Trial 3 Months']
+            preferred_order = [
+                'Trial Week', 'Trial Week (AB)', 'Trial Month', 'Trial 3 Months',
+                'Month $29.99 (AB)',
+                'Upsell Pain Shield ($14.99)', 'Upsell Belly Burner ($14.99)', 'Upsell Bundle ($19.99)',
+            ]
             all_cats_raw = df['category'].unique().tolist()
             all_cats = [c for c in preferred_order if c in all_cats_raw] + sorted([c for c in all_cats_raw if c not in preferred_order])
             selected_cats = st.multiselect(
@@ -138,8 +161,11 @@ if uploaded_file:
                 fill_value=0
             )
             
-            # Фиксированный порядок колонок: Trial Week -> Trial Month -> Trial 3 Months -> остальные
-            preferred_order = ['Trial Week', 'Trial Month', 'Trial 3 Months']
+            preferred_order = [
+                'Trial Week', 'Trial Week (AB)', 'Trial Month', 'Trial 3 Months',
+                'Month $29.99 (AB)',
+                'Upsell Pain Shield ($14.99)', 'Upsell Belly Burner ($14.99)', 'Upsell Bundle ($19.99)',
+            ]
             existing_cols = [c for c in preferred_order if c in pivot.columns]
             other_cols = [c for c in pivot.columns if c not in preferred_order]
             pivot = pivot[existing_cols + sorted(other_cols)]
